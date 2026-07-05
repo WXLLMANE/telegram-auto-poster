@@ -14,12 +14,33 @@ interface GroupInfo {
   lastMessageId?: number;
 }
 
+// Функция для чтения списка ЗАПРЕЩЁННЫХ групп из файла
+function getBlockedGroups(): Set<number> {
+  const configDir = getConfigDirectory();
+  const filePath = path.join(configDir, 'blocked_groups.txt');
+  try {
+    const content = fs.readFileSync(filePath, 'utf-8');
+    const ids = content
+      .split('\n')
+      .map(line => line.trim())
+      .filter(line => line.length > 0)
+      .map(line => Number(line))
+      .filter(id => !isNaN(id));
+    Logger.info(`Загружено запрещённых групп: ${ids.length}`);
+    return new Set(ids);
+  } catch (err) {
+    Logger.info('Файл blocked_groups.txt не найден, блокировка не применяется');
+    return new Set();
+  }
+}
+
 export class TelegramAutoPoster {
   private client: TelegramClient;
   private config: Config;
   private groups: GroupInfo[] = [];
   private postingIntervals: Map<string, NodeJS.Timeout> = new Map();
   private isRunning = false;
+  private slowModeUntil: Map<string, number> = new Map();
 
   private sessionFile: string;
   private session: StringSession;
@@ -27,10 +48,8 @@ export class TelegramAutoPoster {
   constructor(config: Config) {
     this.config = config;
 
-    // Ensure config directory exists
     const configDir = getConfigDirectory();
 
-    // Load existing session if available, otherwise create new one
     this.sessionFile = path.join(configDir, `session.config`);
     let sessionString = '';
 
@@ -74,7 +93,6 @@ export class TelegramAutoPoster {
         await this.authenticate();
       } else {
         Logger.success('Already authorized');
-        // Save session in case it was updated
         this.saveSession();
       }
 
@@ -89,7 +107,7 @@ export class TelegramAutoPoster {
 
       this.isRunning = true;
       Logger.info(
-        `Starting sequential posting: will post to each group with ${this.config.postIntervalMs / 1000}s interval between posts`
+        `Starting parallel posting: will post to groups in batches with concurrency ${process.env.CONCURRENCY || 1}`
       );
       this.startPosting();
       Logger.success('Auto posting started');
@@ -134,23 +152,18 @@ export class TelegramAutoPoster {
         if ('user' in signInResult && signInResult.user) {
           const user = signInResult.user;
           let userName = 'User';
-
-          // Check if user has firstName property (not UserEmpty)
           if ('firstName' in user) {
             userName = user.firstName || 'User';
           } else if ('username' in user && user.username) {
             userName = `@${user.username}`;
           }
-
           Logger.success(`Authentication successful! Logged in as: ${userName}`);
         } else {
           Logger.success('Authentication successful');
         }
 
-        // Save session after successful authentication
         this.saveSession();
       } catch (signInError: any) {
-        // Check if 2FA password is required
         if (
           signInError.errorMessage === 'SESSION_PASSWORD_NEEDED' ||
           (signInError instanceof Error && signInError.message.includes('SESSION_PASSWORD_NEEDED'))
@@ -158,14 +171,10 @@ export class TelegramAutoPoster {
           Logger.info('Two-factor authentication is enabled. Please enter your password:');
           const password = await this.promptInput('Password: ');
 
-          // Get password info for SRP
           const passwordResult = await this.client.invoke(new Api.account.GetPassword());
-
-          // Compute password hash using SRP
           const Password = await import('telegram/Password');
           const passwordCheck = await Password.computeCheck(passwordResult, password);
 
-          // Check password
           const checkPasswordResult = await this.client.invoke(
             new Api.auth.CheckPassword({
               password: passwordCheck,
@@ -175,22 +184,18 @@ export class TelegramAutoPoster {
           if ('user' in checkPasswordResult && checkPasswordResult.user) {
             const user = checkPasswordResult.user;
             let userName = 'User';
-
             if ('firstName' in user) {
               userName = user.firstName || 'User';
             } else if ('username' in user && user.username) {
               userName = `@${user.username}`;
             }
-
             Logger.success(`Authentication successful! Logged in as: ${userName}`);
           } else {
             Logger.success('Authentication successful');
           }
 
-          // Save session after successful authentication
           this.saveSession();
         } else {
-          // Re-throw if it's a different error
           throw signInError;
         }
       }
@@ -234,12 +239,11 @@ export class TelegramAutoPoster {
               title = entity.firstName;
             }
 
-            // Store dialog ID as string (Telegram IDs can be negative for groups)
             const groupId = dialogId.toString();
             this.groups.push({
               id: groupId,
               title,
-              entity, // Store entity for API calls
+              entity,
             });
             Logger.info(`Found group: ${title} (ID: ${groupId})`);
           }
@@ -252,48 +256,77 @@ export class TelegramAutoPoster {
   }
 
   private startPosting(): void {
-    // Start sequential posting: post to one group, wait interval, then next group
     this.postSequentially();
   }
 
+  // Новый метод с параллельной отправкой
   private async postSequentially(): Promise<void> {
+    // Читаем количество параллельных отправок из переменной окружения (по умолчанию 1)
+    const concurrency = parseInt(process.env.CONCURRENCY || '1', 10);
+    Logger.info(`Параллельных отправок: ${concurrency}`);
+
     let currentIndex = 0;
-    let isFirstPost = true;
 
     while (this.isRunning) {
-      if (this.groups.length === 0) {
-        break;
+      if (this.groups.length === 0) break;
+
+      // Формируем батч групп для параллельной отправки
+      const batch: GroupInfo[] = [];
+      for (let i = 0; i < concurrency && i < this.groups.length; i++) {
+        const idx = (currentIndex + i) % this.groups.length;
+        batch.push(this.groups[idx]);
       }
 
-      const group = this.groups[currentIndex];
-      let postSuccess = false;
-      
-      try {
-        await this.postToGroup(group);
-        postSuccess = true;
-      } catch (error) {
-        Logger.error(`Error posting to group "${group.title}"`, error);
-        postSuccess = false;
+      // Фильтруем группы по чёрному списку и slow mode
+      const filteredBatch = batch.filter(group => {
+        const blocked = getBlockedGroups();
+        if (blocked.size > 0 && blocked.has(Number(group.id))) {
+          Logger.info(`Группа "${group.title}" в ЧЁРНОМ списке, пропускаем`);
+          return false;
+        }
+        const blockedUntil = this.slowModeUntil.get(group.id);
+        if (blockedUntil && blockedUntil > Date.now()) {
+          const remaining = Math.ceil((blockedUntil - Date.now()) / 1000);
+          Logger.info(`Группа "${group.title}" заблокирована slow mode ещё ${remaining}с, пропускаем`);
+          return false;
+        } else if (blockedUntil) {
+          this.slowModeUntil.delete(group.id);
+        }
+        return true;
+      });
+
+      if (filteredBatch.length === 0) {
+        // Если все группы отфильтрованы, переходим к следующим
+        currentIndex = (currentIndex + concurrency) % this.groups.length;
+        continue;
       }
 
-      // Mark first post as completed
-      isFirstPost = false;
+      // Запускаем параллельную отправку с небольшой задержкой между стартами (чтобы не выглядеть роботом)
+      const startTime = Date.now();
+      const promises = filteredBatch.map(async (group, index) => {
+        // Искусственная задержка перед отправкой, чтобы разнести по времени
+        const delay = index * 2000; // 2 секунды между стартами отправок
+        await this.sleep(delay);
+        try {
+          await this.postToGroup(group);
+          Logger.info(`✅ Успешно отправлено в "${group.title}"`);
+        } catch (error) {
+          Logger.error(`❌ Ошибка отправки в "${group.title}"`, error);
+        }
+      });
 
-      // Move to next group (wrap around to first group after last)
-      currentIndex = (currentIndex + 1) % this.groups.length;
+      // Ждём завершения всех отправок в батче
+      await Promise.all(promises);
 
-      // Only wait for interval if post was successful
-      // If post failed, try next group immediately without waiting
-      if (postSuccess && this.isRunning) {
-        // Wait for the configured interval before posting to next group
-        // Add random variation (10-20 seconds) to make it less detectable as a bot
-        const randomVariation = Math.floor(Math.random() * 10000) + 10000; // 10-20 seconds in ms
+      // Сдвигаем указатель на concurrency групп вперёд
+      currentIndex = (currentIndex + concurrency) % this.groups.length;
+
+      // Общая пауза между батчами (5 минут + случайная)
+      if (this.isRunning) {
+        const randomVariation = Math.floor(Math.random() * 30000) + 20000;
         const totalWaitTime = this.config.postIntervalMs + randomVariation;
-        const waitSeconds = (totalWaitTime / 1000).toFixed(1);
-        Logger.info(`Waiting ${waitSeconds}s before next post (${this.config.postIntervalMs / 1000}s base + ${(randomVariation / 1000).toFixed(1)}s random)`);
+        Logger.info(`Ожидание ${(totalWaitTime / 1000).toFixed(1)}с перед следующим батчем`);
         await this.sleep(totalWaitTime);
-      } else if (!postSuccess) {
-        Logger.info('Post failed, trying next group immediately without waiting');
       }
     }
   }
@@ -305,7 +338,6 @@ export class TelegramAutoPoster {
   private async postToGroup(group: GroupInfo): Promise<void> {
     Logger.info(`Posting to group: ${group.title} (ID: ${group.id})`);
 
-    // Delete previous message if exists
     if (group.lastMessageId) {
       try {
         await this.client.deleteMessages(group.entity, [group.lastMessageId], {
@@ -317,33 +349,49 @@ export class TelegramAutoPoster {
           `Failed to delete previous message in "${group.title}":`,
           error instanceof Error ? error.message : error
         );
-        // Don't throw here - deletion failure shouldn't prevent posting
       }
     }
 
-    // Send new message - throw error if it fails so we can try next group immediately
-    const sentMessage = await this.client.sendMessage(group.entity, {
-      message: this.config.message,
-    });
+    try {
+      const sentMessage = await this.client.sendMessage(group.entity, {
+        message: this.config.message,
+      });
 
-    if (!sentMessage) {
-      throw new Error(`Failed to send message to "${group.title}" - no response from Telegram`);
-    }
+      if (!sentMessage) {
+        throw new Error(`Failed to send message to "${group.title}" - no response from Telegram`);
+      }
 
-    // Handle different message response types
-    let messageId: number | undefined;
-    if (Array.isArray(sentMessage)) {
-      messageId = sentMessage[0]?.id;
-    } else if (typeof sentMessage === 'object' && 'id' in sentMessage) {
-      messageId = sentMessage.id as number;
-    }
+      let messageId: number | undefined;
+      if (Array.isArray(sentMessage)) {
+        messageId = sentMessage[0]?.id;
+      } else if (typeof sentMessage === 'object' && 'id' in sentMessage) {
+        messageId = sentMessage.id as number;
+      }
 
-    if (messageId) {
-      group.lastMessageId = messageId;
-      Logger.success(`Posted message to "${group.title}" (Message ID: ${messageId})`);
-    } else {
-      Logger.warn(`Posted to "${group.title}" but couldn't get message ID`);
-      // Still consider this a success since message was sent
+      if (messageId) {
+        group.lastMessageId = messageId;
+        Logger.success(`Posted message to "${group.title}" (Message ID: ${messageId})`);
+      } else {
+        Logger.warn(`Posted to "${group.title}" but couldn't get message ID`);
+      }
+    } catch (error: any) {
+      if (
+        error &&
+        error.errorMessage &&
+        typeof error.errorMessage === 'string' &&
+        error.errorMessage.includes('A wait of')
+      ) {
+        const match = error.errorMessage.match(/wait of (\d+) seconds/);
+        if (match) {
+          const seconds = parseInt(match[1], 10);
+          const until = Date.now() + seconds * 1000;
+          this.slowModeUntil.set(group.id, until);
+          Logger.warn(
+            `Slow mode в группе "${group.title}" — ожидание ${seconds}с, блокируем до ${new Date(until).toLocaleTimeString()}`
+          );
+        }
+      }
+      throw error;
     }
   }
 
@@ -351,13 +399,11 @@ export class TelegramAutoPoster {
     Logger.info('Stopping auto poster...');
     this.isRunning = false;
 
-    // Clear all intervals (if any remain from old implementation)
     for (const interval of this.postingIntervals.values()) {
       clearInterval(interval);
     }
     this.postingIntervals.clear();
 
-    // Disconnect client
     if (this.client.connected) {
       await this.client.disconnect();
       Logger.success('Disconnected from Telegram');
