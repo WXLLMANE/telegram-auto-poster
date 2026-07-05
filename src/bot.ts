@@ -119,9 +119,16 @@ export class TelegramAutoPoster {
 
   private async authenticate(): Promise<void> {
     try {
-      Logger.info('Please enter your phone number (with country code, e.g., +1234567890):');
-      const phoneNumber = await this.promptInput('Phone number: ');
+      // 1. Получаем номер телефона из переменной окружения или запрашиваем вручную
+      let phoneNumber = process.env.PHONE_NUMBER;
+      if (!phoneNumber) {
+        Logger.info('Please enter your phone number (with country code, e.g., +1234567890):');
+        phoneNumber = await this.promptInput('Phone number: ');
+      } else {
+        Logger.info(`Using phone number from environment: ${phoneNumber}`);
+      }
 
+      // 2. Отправляем запрос на код
       const result = await this.client.invoke(
         new Api.auth.SendCode({
           phoneNumber,
@@ -137,9 +144,16 @@ export class TelegramAutoPoster {
 
       const phoneCodeHash = result.phoneCodeHash;
 
-      Logger.info('Please enter the code you received:');
-      const code = await this.promptInput('Code: ');
+      // 3. Получаем код из переменной окружения или запрашиваем вручную
+      let code = process.env.TELEGRAM_CODE;
+      if (!code) {
+        Logger.info('Please enter the code you received:');
+        code = await this.promptInput('Code: ');
+      } else {
+        Logger.info(`Using code from environment: ${code}`);
+      }
 
+      // 4. Пытаемся войти
       try {
         const signInResult = await this.client.invoke(
           new Api.auth.SignIn({
@@ -164,6 +178,7 @@ export class TelegramAutoPoster {
 
         this.saveSession();
       } catch (signInError: any) {
+        // Обработка 2FA и других ошибок
         if (
           signInError.errorMessage === 'SESSION_PASSWORD_NEEDED' ||
           (signInError instanceof Error && signInError.message.includes('SESSION_PASSWORD_NEEDED'))
