@@ -183,11 +183,19 @@ export class TelegramAutoPoster {
           signInError.errorMessage === 'SESSION_PASSWORD_NEEDED' ||
           (signInError instanceof Error && signInError.message.includes('SESSION_PASSWORD_NEEDED'))
         ) {
-          Logger.info('Two-factor authentication is enabled. Please enter your password:');
-          const password = await this.promptInput('Password: ');
+          // --- ИЗМЕНЕНИЕ 1: автоматический пароль из переменной окружения ---
+          let password = process.env.TELEGRAM_PASSWORD;
+          if (!password) {
+            Logger.info('Two-factor authentication is enabled. Please enter your password:');
+            password = await this.promptInput('Password: ');
+          } else {
+            Logger.info('Using password from environment (hidden)');
+          }
 
           const passwordResult = await this.client.invoke(new Api.account.GetPassword());
-          const Password = await import('telegram/Password');
+          
+          // --- ИЗМЕНЕНИЕ 2: используем require вместо import для обхода ошибки TS2307 ---
+          const Password = require('telegram/Password');
           const passwordCheck = await Password.computeCheck(passwordResult, password);
 
           const checkPasswordResult = await this.client.invoke(
@@ -317,7 +325,6 @@ export class TelegramAutoPoster {
       }
 
       // Запускаем параллельную отправку с небольшой задержкой между стартами (чтобы не выглядеть роботом)
-      const startTime = Date.now();
       const promises = filteredBatch.map(async (group, index) => {
         // Искусственная задержка перед отправкой, чтобы разнести по времени
         const delay = index * 2000; // 2 секунды между стартами отправок
