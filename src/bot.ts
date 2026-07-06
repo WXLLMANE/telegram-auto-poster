@@ -49,16 +49,26 @@ export class TelegramAutoPoster {
     this.config = config;
 
     const configDir = getConfigDirectory();
-
     this.sessionFile = path.join(configDir, `session.config`);
-    let sessionString = '';
 
-    if (fs.existsSync(this.sessionFile)) {
-      try {
-        sessionString = fs.readFileSync(this.sessionFile, 'utf-8');
-        Logger.info('Loaded existing session from config directory');
-      } catch (error) {
-        Logger.warn('Failed to load session file, starting fresh');
+    // --- НОВОЕ: поддержка SESSION_STRING ---
+    let sessionString = '';
+    const envSession = process.env.SESSION_STRING;
+
+    if (envSession && envSession.trim().length > 0) {
+      sessionString = envSession.trim();
+      Logger.info('Using session from environment variable SESSION_STRING');
+    } else {
+      // Загружаем из файла, если есть
+      if (fs.existsSync(this.sessionFile)) {
+        try {
+          sessionString = fs.readFileSync(this.sessionFile, 'utf-8');
+          Logger.info('Loaded existing session from config directory');
+        } catch (error) {
+          Logger.warn('Failed to load session file, starting fresh');
+        }
+      } else {
+        Logger.info('No session file found, will authenticate from scratch');
       }
     }
 
@@ -74,6 +84,7 @@ export class TelegramAutoPoster {
       const sessionString = this.session.save() as unknown as string;
       if (sessionString) {
         fs.writeFileSync(this.sessionFile, sessionString, 'utf-8');
+        Logger.info('Session saved to file');
       }
     } catch (error) {
       Logger.warn('Failed to save session', error);
@@ -183,7 +194,6 @@ export class TelegramAutoPoster {
           signInError.errorMessage === 'SESSION_PASSWORD_NEEDED' ||
           (signInError instanceof Error && signInError.message.includes('SESSION_PASSWORD_NEEDED'))
         ) {
-          // --- ИЗМЕНЕНИЕ 1: автоматический пароль из переменной окружения ---
           let password = process.env.TELEGRAM_PASSWORD;
           if (!password) {
             Logger.info('Two-factor authentication is enabled. Please enter your password:');
@@ -193,8 +203,6 @@ export class TelegramAutoPoster {
           }
 
           const passwordResult = await this.client.invoke(new Api.account.GetPassword());
-          
-          // --- ИЗМЕНЕНИЕ 2: используем require вместо import для обхода ошибки TS2307 ---
           const Password = require('telegram/Password');
           const passwordCheck = await Password.computeCheck(passwordResult, password);
 
@@ -282,9 +290,7 @@ export class TelegramAutoPoster {
     this.postSequentially();
   }
 
-  // Новый метод с параллельной отправкой
   private async postSequentially(): Promise<void> {
-    // Читаем количество параллельных отправок из переменной окружения (по умолчанию 1)
     const concurrency = parseInt(process.env.CONCURRENCY || '1', 10);
     Logger.info(`Параллельных отправок: ${concurrency}`);
 
@@ -293,14 +299,12 @@ export class TelegramAutoPoster {
     while (this.isRunning) {
       if (this.groups.length === 0) break;
 
-      // Формируем батч групп для параллельной отправки
       const batch: GroupInfo[] = [];
       for (let i = 0; i < concurrency && i < this.groups.length; i++) {
         const idx = (currentIndex + i) % this.groups.length;
         batch.push(this.groups[idx]);
       }
 
-      // Фильтруем группы по чёрному списку и slow mode
       const filteredBatch = batch.filter(group => {
         const blocked = getBlockedGroups();
         if (blocked.size > 0 && blocked.has(Number(group.id))) {
@@ -319,15 +323,12 @@ export class TelegramAutoPoster {
       });
 
       if (filteredBatch.length === 0) {
-        // Если все группы отфильтрованы, переходим к следующим
         currentIndex = (currentIndex + concurrency) % this.groups.length;
         continue;
       }
 
-      // Запускаем параллельную отправку с небольшой задержкой между стартами (чтобы не выглядеть роботом)
       const promises = filteredBatch.map(async (group, index) => {
-        // Искусственная задержка перед отправкой, чтобы разнести по времени
-        const delay = index * 2000; // 2 секунды между стартами отправок
+        const delay = index * 2000;
         await this.sleep(delay);
         try {
           await this.postToGroup(group);
@@ -337,13 +338,10 @@ export class TelegramAutoPoster {
         }
       });
 
-      // Ждём завершения всех отправок в батче
       await Promise.all(promises);
 
-      // Сдвигаем указатель на concurrency групп вперёд
       currentIndex = (currentIndex + concurrency) % this.groups.length;
 
-      // Общая пауза между батчами (5 минут + случайная)
       if (this.isRunning) {
         const randomVariation = Math.floor(Math.random() * 30000) + 20000;
         const totalWaitTime = this.config.postIntervalMs + randomVariation;
